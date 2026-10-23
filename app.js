@@ -18,17 +18,168 @@ const $ = (selector) => document.querySelector(selector);
 const svg = $('#spiral');
 const ns = 'http://www.w3.org/2000/svg';
 function element(tag, attrs){const el=document.createElementNS(ns,tag);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,v));return el;}
-const turns= Math.PI*5.1;
-function point(t){const r=25+240*t/turns; const angle=t-1.8;return [350+r*Math.cos(angle),305+r*Math.sin(angle)];}
-const points=Array.from({length:650},(_,i)=>point(i/649*turns));
-const path=points.map(([x,y],i)=>`${i?'L':'M'}${x.toFixed(2)},${y.toFixed(2)}`).join(' ');
-[86,164,245].forEach(r=>svg.append(element('circle',{cx:350,cy:305,r,class:'orbit-guide'})));
-svg.append(element('path',{d:path,class:'spiral-line'}));
-const highlight=element('path',{d:path,class:'spiral-glow','stroke-dasharray':'0 9999'});svg.append(highlight);
-const tabs=$('#year-tabs');
-DATA.forEach((item,i)=>{const t=2.7+(turns-3.1)*i/(DATA.length-1);const [x,y]=point(t);const g=element('g',{class:'year-node',tabindex:0,role:'button','aria-label':`Открыть ${item.year} год`,transform:`translate(${x},${y})`});g.dataset.year=item.year;g.append(element('circle',{r:24,class:'halo'}),element('circle',{r:7,class:'dot'}));const text=element('text',{x:x>350?17:-17,y:5,'text-anchor':x>350?'start':'end'});text.textContent=item.year;g.append(text);g.addEventListener('click',()=>selectYear(item.year,true));g.addEventListener('keydown',e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();selectYear(item.year,true);}});svg.append(g);const b=document.createElement('button');b.className='year-tab';b.textContent=item.year;b.dataset.year=item.year;b.addEventListener('click',()=>selectYear(item.year,true));tabs.append(b);});
-let selectedYear=1969;
-function selectYear(year,animate=false){selectedYear=year;const item=DATA.find(x=>x.year===year);$('#year').textContent=year;$('#year-description').textContent=item.description;$('#counter').textContent=`${String(DATA.indexOf(item)+1).padStart(2,'0')} / 06`;document.querySelectorAll('[data-year]').forEach(el=>{const active=+el.dataset.year===year;el.classList.toggle('active',active);el.setAttribute('aria-pressed',String(active));});$('#events').replaceChildren();item.events.forEach(event=>{const card=document.createElement('button');card.className='event-card';card.innerHTML=`<div class="event-image"><img alt="${event.title}" src="${event.photos[0].url}"><span class="event-badge">${event.photos.length} ${event.photos.length===1?'фотография':'фотографии'}</span><span class="event-arrow">↗</span></div><div class="event-info"><h3>${event.title}</h3><span>${event.date}</span></div><div class="event-tags">${event.tags.map(t=>'#'+t).join(' · ')}</div>`;card.addEventListener('click',()=>openEvent(event));attachImageFallback(card.querySelector('img'));$('#events').append(card);});const index=DATA.indexOf(item);const length=highlight.getTotalLength();highlight.setAttribute('stroke-dasharray',`${length*(.18+.82*index/5)} ${length}`);if(animate){const [x,y]=point(2.7+(turns-3.1)*index/5);svg.style.transform=`translate(${(350-x)*.09}px,${(305-y)*.09}px) scale(1.08)`;}}
+const turns = Math.PI * 5.1;
+const yearTime = index => 2.7 + (turns - 3.1) * index / (DATA.length - 1);
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
+const stage = $('.orbit-stage');
+const history = [];
+let selectedYear = 1969;
+let focusIndex = null;
+let pose = { focus: 0, time: yearTime(1) };
+let frame = 0;
+let transitionId = 0;
+const segments = [];
+const nodes = [];
+const photoNodes = [];
+
+function position(t, camera = pose) {
+  const baseRadius = 25 + 240 * t / turns;
+  const focusedRadius = 152 * Math.exp((t - camera.time) * .21);
+  const radius = baseRadius + (focusedRadius - baseRadius) * camera.focus;
+  // Reduce the angular distance between memories as the chosen turn unwinds.
+  const angle = (t - 1.8) * (1 - camera.focus)
+    + ((t - camera.time) * .62 - .6) * camera.focus;
+  return [350 + radius * Math.cos(angle), 305 + radius * Math.sin(angle)];
+}
+function visibility(t, x, y) {
+  const edge = Math.min(x - 25, 675 - x, y - 65, 545 - y);
+  const peripheral = Math.max(0, Math.min(1, (edge + 40) / 85));
+  const future = Math.exp(-Math.max(0, t - pose.time - .25) * pose.focus * .45);
+  return peripheral * future;
+}
+function activate(el, callback) {
+  el.addEventListener('click', callback);
+  el.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); callback(); }
+  });
+}
+const defs = element('defs', {});
+const clip = element('clipPath', {id:'orbit-photo-clip'});
+clip.append(element('rect', {width:108,height:72,rx:6}));
+defs.append(clip); svg.append(defs);
+for (let i = 0; i < 90; i++) {
+  const line = element('path', {class:'time-segment', 'vector-effect':'non-scaling-stroke'});
+  svg.append(line); segments.push(line);
+}
+const tabs = $('#year-tabs');
+DATA.forEach((item, index) => {
+  const node = element('g', {class:'year-node', tabindex:0, role:'button',
+    'aria-label':`Приблизить ${item.year} год`});
+  node.dataset.year = item.year;
+  node.append(element('circle', {r:24,class:'halo'}), element('circle',{r:7,class:'dot'}));
+  const label = element('text', {x:16,y:5}); label.textContent=item.year; node.append(label);
+  activate(node, () => selectYear(item.year));
+  nodes.push(node);
+  item.events.forEach((event, eventIndex) => {
+    const tile = element('g', {class:'orbit-photo', tabindex:0,role:'button',
+      'aria-label':`${item.year}: ${event.title}`});
+    tile.append(element('rect',{width:108,height:72,rx:6,class:'orbit-photo-bg'}));
+    const image = element('image',{href:event.photos[0].url,width:108,height:72,
+      preserveAspectRatio:'xMidYMid slice','clip-path':'url(#orbit-photo-clip)'});
+    tile.append(image);
+    const caption = element('text',{x:7,y:65,class:'orbit-photo-label'});
+    caption.textContent=String(item.year);tile.append(caption);
+    // Keep the year/title card usable even if a remote image cannot load.
+    activate(tile, () => {
+      if (focusIndex !== index) selectYear(item.year);
+      else openEvent(event);
+    });
+    svg.append(tile); photoNodes.push({tile,index,eventIndex});
+  });
+  svg.append(node);
+  const tab = document.createElement('button');
+  tab.className='year-tab';tab.textContent=item.year;tab.dataset.year=item.year;
+  tab.onclick=()=>selectYear(item.year);tabs.append(tab);
+});
+function draw() {
+  segments.forEach((line,index) => {
+    const a=turns*index/segments.length, b=turns*(index+1)/segments.length;
+    let d='';
+    for(let step=0;step<=8;step++){
+      const [x,y]=position(a+(b-a)*step/8);d+=`${step?'L':'M'}${x.toFixed(2)},${y.toFixed(2)} `;
+    }
+    line.setAttribute('d',d);
+    const middle=(a+b)/2;
+    line.style.opacity=String(.65*Math.exp(-Math.max(0,middle-pose.time)*pose.focus*.4));
+    line.classList.toggle('lit',Math.abs(middle-pose.time)<1.4 && pose.focus>.1);
+  });
+  nodes.forEach((node,index)=>{
+    const t=yearTime(index), [x,y]=position(t), opacity=visibility(t,x,y);
+    node.setAttribute('transform',`translate(${x},${y})`);
+    node.style.opacity=String(opacity);
+    node.style.pointerEvents=opacity<.12?'none':'';
+    node.setAttribute('tabindex',opacity<.12?'-1':'0');
+    node.setAttribute('aria-hidden',String(opacity<.12));
+  });
+  photoNodes.forEach(({tile,index,eventIndex})=>{
+    const t=yearTime(index),[x,y]=position(t);
+    const chosen=Math.exp(-Math.abs(t-pose.time)*1.4)*pose.focus;
+    const scale=.54+chosen*.64;
+    const tx=x+18,ty=y+18+eventIndex*(46+chosen*45);
+    const opacity=visibility(t,tx+54*scale,ty+36*scale);
+    tile.setAttribute('transform',`translate(${tx},${ty}) scale(${scale})`);
+    tile.style.opacity=String(opacity*(.52+.48*chosen));
+    tile.style.pointerEvents=opacity<.12?'none':'';
+    tile.setAttribute('tabindex',opacity<.12?'-1':'0');
+    tile.setAttribute('aria-hidden',String(opacity<.12));
+  });
+  $('.center-label').style.opacity=String(1-pose.focus);
+  svg.dataset.focus=pose.focus.toFixed(3);
+}
+function animateTo(target) {
+  cancelAnimationFrame(frame);
+  const id=++transitionId;
+  const from={...pose},start=performance.now(),duration=reduceMotion.matches?0:2100;
+  stage.classList.add('travelling');
+  function tick(now) {
+    if(id!==transitionId)return;
+    const fraction=duration?Math.min(1,(now-start)/duration):1;
+    const ease=fraction*fraction*(3-2*fraction);
+    pose={focus:from.focus+(target.focus-from.focus)*ease,
+      time:from.time+(target.time-from.time)*ease};
+    draw();
+    if(fraction<1)frame=requestAnimationFrame(tick);
+    else stage.classList.remove('travelling');
+  }
+  frame=requestAnimationFrame(tick);
+}
+function renderEvents() {
+  const item=DATA.find(x=>x.year===selectedYear);
+  $('#year').textContent=item.year;
+  $('#year-description').textContent=item.description;
+  $('#counter').textContent=`${String(DATA.indexOf(item)+1).padStart(2,'0')} / ${String(DATA.length).padStart(2,'0')}`;
+  document.querySelectorAll('[data-year]').forEach(el=>{
+    const active=+el.dataset.year===selectedYear;
+    el.classList.toggle('active',active);el.setAttribute('aria-pressed',String(active));
+  });
+  $('#events').replaceChildren();
+  item.events.forEach(event=>{
+    const card=document.createElement('button');card.className='event-card';
+    card.innerHTML=`<div class="event-image"><img alt="${event.title}" src="${event.photos[0].url}"><span class="event-badge">${event.photos.length} ${event.photos.length===1?'фотография':'фотографии'}</span><span class="event-arrow">↗</span></div><div class="event-info"><h3>${event.title}</h3><span>${event.date}</span></div><div class="event-tags">${event.tags.map(t=>'#'+t).join(' · ')}</div>`;
+    card.onclick=()=>openEvent(event);attachImageFallback(card.querySelector('img'));$('#events').append(card);
+  });
+  $('#back').disabled=history.length===0;
+  $('#view-status').textContent=focusIndex===null?'Вся история · выберите год':`${selectedYear} · более позднее время за краем`;
+  $('#orbit-hint').textContent=focusIndex===null?'Выберите год, чтобы приблизить виток':'Нажмите на фото · вернуться можно кнопкой «Назад»';
+  stage.classList.toggle('focused',focusIndex!==null);
+}
+function selectYear(year) {
+  const index=DATA.findIndex(item=>item.year===year);
+  if(focusIndex===index)return;
+  history.push({year:selectedYear,index:focusIndex});
+  selectedYear=year;focusIndex=index;
+  renderEvents();animateTo({focus:1,time:yearTime(index)});
+}
+$('#back').onclick=()=>{
+  const previous=history.pop();if(!previous)return;
+  selectedYear=previous.year;focusIndex=previous.index;
+  renderEvents();animateTo({focus:focusIndex===null?0:1,time:yearTime(focusIndex??1)});
+};
+$('#reset').onclick=()=>{
+  history.length=0;selectedYear=1969;focusIndex=null;
+  renderEvents();animateTo({focus:0,time:yearTime(1)});
+};
+renderEvents();draw();
 function attachImageFallback(img){img.addEventListener('error',()=>{img.hidden=true;const message=document.createElement('span');message.className='image-error';message.textContent='Фотография недоступна. Откройте источник ↗';message.style.cssText='display:grid;place-items:center;min-height:140px;padding:20px;font-size:12px;color:#a7b29d';img.parentNode.append(message);});}
 let currentEvent=null,photoIndex=0;
 function openEvent(event){currentEvent=event;photoIndex=0;$('#gallery-title').textContent=event.title;$('#gallery-meta').textContent=`${selectedYear} / ${event.date}`;$('#tags').textContent=event.tags.map(t=>'#'+t).join('  ');showPhoto();$('#gallery').showModal();}
@@ -38,4 +189,4 @@ function movePhoto(step){photoIndex=(photoIndex+step+currentEvent.photos.length)
 $('#previous').onclick=()=>movePhoto(-1);$('#next').onclick=()=>movePhoto(1);
 document.querySelectorAll('dialog').forEach(dialog=>{dialog.querySelector('.close').onclick=()=>dialog.close();dialog.addEventListener('click',e=>{if(e.target===dialog){const r=dialog.getBoundingClientRect();if(e.clientX<r.left||e.clientX>r.right||e.clientY<r.top||e.clientY>r.bottom)dialog.close();}});});
 document.addEventListener('keydown',e=>{if($('#gallery').open&&['ArrowLeft','ArrowRight'].includes(e.key)){e.preventDefault();movePhoto(e.key==='ArrowRight'?1:-1);}});
-$('#about').onclick=()=>$('#about-dialog').showModal();$('#reset').onclick=()=>{svg.style.transform='';selectYear(1969);};selectYear(1969);
+$('#about').onclick=()=>$('#about-dialog').showModal();
